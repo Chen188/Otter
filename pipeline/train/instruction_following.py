@@ -33,6 +33,12 @@ import json
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 
+# Try importing IdeficsForVisionText2Text, and if it's not available, define a dummy class
+try:
+    from transformers import IdeficsForVisionText2Text
+except ImportError:
+    print("IdeficsForVisionText2Text does not exist")
+    IdeficsForVisionText2Text = type(None)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -65,8 +71,9 @@ def train_one_epoch(args, model, epoch, mimicit_loaders, tokenizer, optimizer, l
     step_time_m = AverageMeter()  # time for one optimizer step (> 1 batch if using gradient accum)
     data_time_m = AverageMeter()  # avg time to load one batch of both C4 AND laion (= 1 batch regardless of gradient accum)
     end = time.time()
-    dtype = accelerator.unwrap_model(model).dtype
-    print(f"Using dtype {dtype}")
+
+    autocast_type = torch.bfloat16 if accelerator.mixed_precision == "bf16" else torch.float32
+    print(f"Using dtype {autocast_type}")
 
     # loop through dataloader
     for num_steps, (batch_mimicits) in tqdm(
@@ -122,13 +129,6 @@ def train_one_epoch(args, model, epoch, mimicit_loaders, tokenizer, optimizer, l
             labels[labels == answer_token_id] = -100
             labels[labels == media_token_id] = -100
 
-            # Try importing IdeficsForVisionText2Text, and if it's not available, define a dummy class
-            try:
-                from transformers import IdeficsForVisionText2Text
-            except ImportError:
-                print("IdeficsForVisionText2Text does not exist")
-                IdeficsForVisionText2Text = type(None)
-
             with accelerator.autocast():
                 unwrapped_model = accelerator.unwrap_model(model)
 
@@ -139,7 +139,7 @@ def train_one_epoch(args, model, epoch, mimicit_loaders, tokenizer, optimizer, l
                     assert images.shape[1] == 1, "The second dimension is not 1"
 
                     loss_mimicit = model(
-                        pixel_values=images.squeeze(1).to(dtype),
+                        pixel_values=images.squeeze(1).to(autocast_type),
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         image_attention_mask=image_attention_mask,
@@ -147,7 +147,7 @@ def train_one_epoch(args, model, epoch, mimicit_loaders, tokenizer, optimizer, l
                     )[0]
                 else:
                     loss_mimicit = model(
-                        vision_x=images.to(dtype),
+                        vision_x=images.to(autocast_type),
                         lang_x=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
@@ -224,19 +224,19 @@ def train_one_epoch(args, model, epoch, mimicit_loaders, tokenizer, optimizer, l
                 # gc.collect()  # forces garbage collection
 
             if args.rank == 0 and global_step != 0 and (args.save_steps_interval != -1) and (global_step % args.save_steps_interval == 0):
-                if not os.path.exists(args.external_save_dir):
-                    os.makedirs(args.external_save_dir)
+                if not os.path.exists(args.external_checkpoint_save_dir):
+                    os.makedirs(args.external_checkpoint_save_dir)
 
                 unwrapped_model = accelerator.unwrap_model(model)
                 checkpoint_dict = {
                     "steps": global_step,
                     "model_state_dict": get_checkpoint(unwrapped_model),
                 }
-                print(f"Saving checkpoint to {args.external_save_dir}/checkpoint_steps_{global_step}.pt")
-                accelerator.save(checkpoint_dict, f"{args.external_save_dir}/checkpoint_steps_{global_step}.pt")
+                print(f"Saving checkpoint to {args.external_checkpoint_save_dir}/checkpoint_steps_{global_step}.pt")
+                accelerator.save(checkpoint_dict, f"{args.external_checkpoint_save_dir}/checkpoint_steps_{global_step}.pt")
                 if args.delete_previous_checkpoint:
-                    if epoch > 0 and os.path.exists(f"{args.external_save_dir}/checkpoint_step_{global_step-args.save_steps_interval}.pt"):
-                        os.remove(f"{args.external_save_dir}/checkpoint_step_{global_step-args.save_steps_interval}.pt")
+                    if epoch > 0 and os.path.exists(f"{args.external_checkpoint_save_dir}/checkpoint_step_{global_step-args.save_steps_interval}.pt"):
+                        os.remove(f"{args.external_checkpoint_save_dir}/checkpoint_step_{global_step-args.save_steps_interval}.pt")
 
         # Log loss to console
         if ((num_steps + 1) % args.logging_steps == 0) and args.rank == 0:
@@ -255,10 +255,16 @@ def parse_args():
 
     # Model configuration arguments
     parser.add_argument(
-        "--external_save_dir",
+        "--external_model_save_dir",
         type=str,
-        default=None,
-        help="set to save model to external path",
+        default=os.environ.get('SM_MODEL_DIR'),
+        help="set to save final model to external path",
+    )
+    parser.add_argument(
+        "--external_checkpoint_save_dir",
+        type=str,
+        default='/opt/ml/checkpoints/',
+        help="set to save checkpoint to external path",
     )
     parser.add_argument(
         "--run_name",
@@ -408,9 +414,15 @@ def parse_args():
     )
 
     # optimizer args
-    parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--save_ckpt_each_epoch", action="store_true")
+    parser.add_argument("--gradient_checkpointing", 
+        default=False,
+        type=bool,)
+    parser.add_argument("--offline",
+        default=False,
+        type=bool,)
+    parser.add_argument("--save_ckpt_each_epoch", 
+        default=False,
+        type=bool,)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--logging_steps", type=int, default=100, help="log loss every n steps")
     # Sum of gradient optimization batch size
@@ -454,17 +466,19 @@ def parse_args():
     parser.add_argument(
         "--horovod",
         default=False,
-        action="store_true",
+        type=bool,
         help="Use horovod for distributed training.",
     )
     parser.add_argument(
         "--no-set-device-rank",
         default=False,
-        action="store_true",
+        type=bool,
         help="Don't set device index from local rank (when CUDA_VISIBLE_DEVICES restricted to one per proc).",
     )
     # YH: Training detail
-    parser.add_argument("--mask_lm_head", action="store_true")
+    parser.add_argument("--mask_lm_head", 
+        default=False,
+        type=bool)
     parser.add_argument(
         "--max-src-length",
         type=int,
@@ -479,9 +493,13 @@ def parse_args():
     )
     parser.add_argument("--patch-image-size", type=int, default=224)
     # this could potentially save 33GB of all model parameters for otter-9b, including the language and vision model.
-    parser.add_argument("--save_hf_model", default=False, action="store_true")
+    parser.add_argument("--save_hf_model", 
+        default=False,
+        type=bool,)
     # wandb args
-    parser.add_argument("--report_to_wandb", default=False, action="store_true")
+    parser.add_argument("--report_to_wandb",
+        default=False,
+        type=bool,)
     parser.add_argument(
         "--wandb_project",
         type=str,
@@ -493,19 +511,20 @@ def parse_args():
     parser.add_argument(
         "--save_checkpoints_to_wandb",
         default=False,
-        action="store_true",
+        type=bool,
         help="save checkpoints to wandb",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
         default=False,
-        action="store_true",
+        type=bool,
         help="resume from checkpoint (original openflamingo pt format, not hf format)",
     )
     # TODO: remove additional data args, all args would be processed in above parser
     parser.add_argument(
         "--delete_previous_checkpoint",
-        action="store_true",
+        default=False,
+        type=bool,
         help="delete previous checkpoint when saving new checkpoint",
     )
     # parser = add_data_args(parser)
@@ -539,6 +558,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print(args)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
     if accelerator.state.deepspeed_plugin is not None:
         accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = args.batch_size
@@ -548,6 +568,7 @@ def main():
     if args.pretrained_model_name_or_path is not None:
         accelerator.print(f"Loading pretrained model from {args.pretrained_model_name_or_path}")
         device_map = {"": device_id} if accelerator.distributed_type == "MULTI_GPU" or accelerator.distributed_type == "DEEPSPEED" else "auto"
+
         if "otter" in args.model_name.lower():
             model = OtterForConditionalGeneration.from_pretrained(
                 args.pretrained_model_name_or_path,
@@ -664,14 +685,14 @@ def main():
 
     resume_from_epoch = 0
     # check if a checkpoint exists for this run
-    args.external_save_dir = os.path.join(args.external_save_dir, args.run_name) if args.external_save_dir else args.run_name
-    if os.path.exists(f"{args.external_save_dir}") and args.resume_from_checkpoint is True:
-        checkpoint_list = glob.glob(f"{args.external_save_dir}/checkpoint_*.pt")
+    args.external_checkpoint_save_dir = os.path.join(args.external_checkpoint_save_dir, args.run_name) if args.external_checkpoint_save_dir else args.run_name
+    if os.path.exists(f"{args.external_checkpoint_save_dir}") and args.resume_from_checkpoint is True:
+        checkpoint_list = glob.glob(f"{args.external_checkpoint_save_dir}/checkpoint_*.pt")
         if len(checkpoint_list) == 0:
-            print(f"Found no checkpoints for run {args.external_save_dir}.")
+            print(f"Found no checkpoints for run {args.external_checkpoint_save_dir}.")
         else:
             resume_from_checkpoint_path = sorted(checkpoint_list, key=lambda x: int(x.split("_")[-1].split(".")[0]))[-1]
-            print(f"Found checkpoint {resume_from_checkpoint_path} for run {args.external_save_dir}.")
+            print(f"Found checkpoint {resume_from_checkpoint_path} for run {args.external_checkpoint_save_dir}.")
 
         if args.rank == 0:
             print(f"Loading checkpoint from {resume_from_checkpoint_path}")
@@ -738,8 +759,8 @@ def main():
 
         if args.save_ckpt_each_epoch:
             if args.rank == 0:
-                if not os.path.exists(args.external_save_dir):
-                    os.makedirs(args.external_save_dir)
+                if not os.path.exists(args.external_checkpoint_save_dir):
+                    os.makedirs(args.external_checkpoint_save_dir)
 
             if accelerator.distributed_type == "DEEPSPEED" and accelerator.state.deepspeed_plugin.zero_stage == 3:
                 checkpoint_dict = accelerator.get_state_dict(model)
@@ -765,28 +786,31 @@ def main():
                     }
 
             if args.rank == 0:
-                print(f"Saving checkpoint to {args.external_save_dir}/checkpoint_{epoch}.pt")
-                accelerator.save(checkpoint_dict, f"{args.external_save_dir}/checkpoint_{epoch}.pt")
+                print(f"Saving checkpoint to {args.external_checkpoint_save_dir}/checkpoint_{epoch}.pt")
+                accelerator.save(checkpoint_dict, f"{args.external_checkpoint_save_dir}/checkpoint_{epoch}.pt")
                 # save the config
-                unwrapped_model.config.save_pretrained(args.external_save_dir)
+                unwrapped_model.config.save_pretrained(args.external_checkpoint_save_dir)
                 if args.delete_previous_checkpoint:
                     if epoch > 0:
-                        os.remove(f"{args.external_save_dir}/checkpoint_{epoch-1}.pt")
+                        os.remove(f"{args.external_checkpoint_save_dir}/checkpoint_{epoch-1}.pt")
 
             accelerator.wait_for_everyone()
 
     accelerator.wait_for_everyone()
 
     if args.rank == 0:
-        if not os.path.exists(args.external_save_dir):
-            os.makedirs(args.external_save_dir)
+        if not os.path.exists(args.external_checkpoint_save_dir):
+            os.makedirs(args.external_checkpoint_save_dir)
+
+        if not os.path.exists(args.external_model_save_dir):
+            os.makedirs(args.external_model_save_dir)
 
     if accelerator.distributed_type == "DEEPSPEED" and accelerator.state.deepspeed_plugin.zero_stage == 3:
         checkpoint_dict = accelerator.get_state_dict(model)
 
         unwrapped_model = accelerator.unwrap_model(model)
 
-        unwrapped_model.config.save_pretrained(args.external_save_dir)
+        unwrapped_model.config.save_pretrained(args.external_model_save_dir)
 
         if args.rank == 0 and not args.save_hf_model:
             trainable_params_name = [name for name, p in unwrapped_model.named_parameters() if p.requires_grad]
@@ -796,11 +820,11 @@ def main():
 
             accelerator.save(
                 checkpoint_dict,
-                f"{args.external_save_dir}/final_weights.pt",
+                f"{args.external_model_save_dir}/final_weights.pt",
             )
         elif args.rank == 0 and args.save_hf_model:
             unwrapped_model.save_pretrained(
-                f"{args.external_save_dir}",
+                f"{args.external_model_save_dir}",
                 is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save,
                 state_dict=checkpoint_dict,
@@ -813,15 +837,15 @@ def main():
 
             accelerator.save(
                 checkpoint_dict,
-                f"{args.external_save_dir}/final_weights.pt",
+                f"{args.external_model_save_dir}/final_weights.pt",
             )
             # save the config
-            unwrapped_model.config.save_pretrained(args.external_save_dir)
+            unwrapped_model.config.save_pretrained(args.external_model_save_dir)
 
             if args.report_to_wandb and args.save_checkpoints_to_wandb:
-                wandb.save(f"{args.external_save_dir}/final_weights.pt")
+                wandb.save(f"{args.external_model_save_dir}/final_weights.pt")
             if args.save_hf_model:
-                unwrapped_model.save_pretrained(f"{args.external_save_dir}")
+                unwrapped_model.save_pretrained(f"{args.external_model_save_dir}")
 
     accelerator.wait_for_everyone()
 
